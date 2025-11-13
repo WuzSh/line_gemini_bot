@@ -19,6 +19,7 @@ line_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+
 def build_prompt(user_text):
     return f"""
 あなたは共感的で優しい心理カウンセラーです。
@@ -29,10 +30,18 @@ def build_prompt(user_text):
 AI:
 """
 
-@app.route("/callback", methods=["POST"])
+
+# 👇 Webhook検証(GET)にも対応
+@app.route("/callback", methods=["GET", "POST"])
 def callback():
+    # ✅ LINEのWebhook検証時（GET）の対応
+    if request.method == "GET":
+        return "OK", 200
+
+    # ✅ 実際のLINEからのPOSTリクエスト処理
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
@@ -43,9 +52,10 @@ def callback():
         if event["type"] == "message" and event["message"]["type"] == "text":
             text = event["message"]["text"]
             prompt = build_prompt(text)
+
             try:
                 response = client.models.generate_content(
-                    model="gemini-2.0-flash",  # 最新モデルを指定
+                    model="gemini-2.0-flash",
                     contents=prompt
                 )
                 reply_text = response.text.strip()
@@ -59,9 +69,12 @@ def callback():
 
     return "OK", 200
 
+
 @app.route("/", methods=["GET"])
 def index():
     return "LINE Gemini Bot running.", 200
 
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
