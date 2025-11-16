@@ -1,6 +1,4 @@
-
-# app.py 
-
+# app.py (グループ対応済みフル版)
 import os
 import json
 import time
@@ -167,7 +165,10 @@ def _simple_answer_hint(user_text):
 
 
 # ====== 非同期処理ワークフロー（target_id対応） ======
-def process_and_push(target_id, original_text, reply_token):
+def process_and_push(target_id, original_text, reply_token=None):
+    """
+    target_id: userId or groupId or roomId
+    """
     try:
         memory = conversation_memory[target_id]
         current_phase = memory["phase"]
@@ -178,7 +179,7 @@ def process_and_push(target_id, original_text, reply_token):
 
         prompt = build_prompt_with_context(target_id, original_text)
 
-        # ===== Gemini =====
+        # Call Gemini
         try:
             resp = genai_client.models.generate_content(
                 model=GENI_MODEL,
@@ -186,24 +187,26 @@ def process_and_push(target_id, original_text, reply_token):
             )
             reply_text = getattr(resp, "text", str(resp)).strip()
         except Exception as e:
-            print("GenAI error:", e)
-            reply_text = "すみません、外部処理でエラーが起きました。"
+            print("GenAI call failed:", e)
+            reply_text = "すみません、ただいま外部情報の取得に失敗しました。もう一度お願いできますか？"
 
         reply_text = ensure_answer_not_only_question(reply_text, original_text)
 
-        # メモリ保存
+        # update memory using target_id key so group chats keep shared context
         memory["history"].append({"role": "user", "content": original_text})
         memory["history"].append({"role": "assistant", "content": reply_text})
+        if len(memory["history"]) > MAX_HISTORY * 2:
+            memory["history"] = memory["history"][-MAX_HISTORY*2 :]
 
-        # ===== ここが重要：reply_token を使用する =====
+        # push result to the correct target (user/group/room)
         try:
-            line_api.reply_message(reply_token, TextSendMessage(text=reply_text))
-            print(f"Replied to {target_id}")
+            line_api.push_message(target_id, TextSendMessage(text=reply_text))
+            print(f"Pushed reply to {target_id}")
         except Exception as e:
-            print("Reply failed:", e)
-
+            print("Push failed:", e)
+            # log and continue
     except Exception as e:
-        print("Background error:", e)
+        print("Background processing error:", e)
 
 
 # ====== Flask webhook endpoint ======
