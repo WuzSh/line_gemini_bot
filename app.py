@@ -1,4 +1,4 @@
-# app.py
+# app.py (グループ対応済みフル版)
 import os
 import json
 import time
@@ -43,8 +43,9 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ====== メモリと重複防止 ======
-# user_memory: user_id -> {"history":[...], "phase":"empathy"}
-user_memory = defaultdict(lambda: {"history": [], "phase": "empathy"})
+# conversation_memory: target_id -> {"history":[...], "phase":"empathy"}
+# target_id is userId or groupId or roomId depending on source
+conversation_memory = defaultdict(lambda: {"history": [], "phase": "empathy"})
 # processed event ids to avoid duplicate processing
 processed_event_ids = set()
 
@@ -74,13 +75,8 @@ PHASE_INSTRUCTIONS = {
 
 # ====== ユーティリティ: Google Custom Search（任意） ======
 def perform_web_search(query, max_results=3):
-    """
-    If GOOGLE_CSE_API_KEY and CX are provided, call Google Custom Search JSON API.
-    Returns a list of dicts: {"title":..., "snippet":..., "link":...}
-    """
     if not USE_WEB_SEARCH:
         return []
-
     try:
         url = "https://www.googleapis.com/customsearch/v1"
         params = {
@@ -108,11 +104,9 @@ def perform_web_search(query, max_results=3):
 # ====== フェーズ遷移ロジック（単純ルール） ======
 def detect_phase_from_text(current_phase, user_text, history_len):
     text = user_text.lower()
-    # empathy -> awareness triggers
     if current_phase == "empathy":
         if any(k in text for k in ["なぜ", "どうして", "理由", "意味"]) or history_len >= 3:
             return "awareness"
-    # awareness -> reconstruction triggers
     if current_phase == "awareness":
         if any(k in text for k in ["自分", "自由", "選ぶ", "したい", "できる"]):
             return "reconstruction"
@@ -120,30 +114,26 @@ def detect_phase_from_text(current_phase, user_text, history_len):
 
 
 # ====== プロンプト組み立て ======
-def build_prompt_with_context(user_id, user_text):
-    memory = user_memory[user_id]
-    history = memory["history"][-MAX_HISTORY:]  # latest slice
+def build_prompt_with_context(target_id, user_text):
+    memory = conversation_memory[target_id]
+    history = memory["history"][-MAX_HISTORY:]
     phase = memory["phase"]
 
-    # optional web search enrichment
     web_items = []
     if USE_WEB_SEARCH:
         web_items = perform_web_search(user_text, max_results=3)
 
-    # build history text
     history_text = ""
     for turn in history[-6:]:
         role = "ユーザー" if turn["role"] == "user" else "AI"
         history_text += f"{role}: {turn['content']}\n"
 
-    # include web results summary if present
     web_text = ""
     if web_items:
         web_text = "\n\n参考にした外部情報（要約）:\n"
         for i, it in enumerate(web_items, start=1):
             web_text += f"{i}. {it['title']} — {it['snippet']}\n"
 
-    # final prompt: rules + phase instr + history + web_text + user question
     prompt = (
         BASE_RULES
         + "\n\n"
@@ -161,16 +151,12 @@ def build_prompt_with_context(user_id, user_text):
 
 # ====== 生成後チェック: 質問だけで終わっていないかを補正 ======
 def ensure_answer_not_only_question(reply_text, user_text):
-    # if reply ends with a question mark or contains many "?" and isn't giving info, add a brief answer header
     trimmed = reply_text.strip()
-    # heuristics: if reply is short (<20 chars) and contains '?', or starts with '?'
     if ("?" in trimmed or "？" in trimmed) and len(trimmed) < 60:
-        # Prepend a brief answer sentence to avoid question-only behavior
         return f"まず結論を言うと、{_simple_answer_hint(user_text)}\n\n{trimmed}"
     return trimmed
 
 def _simple_answer_hint(user_text):
-    # naive simple hint: try to extract if user asked what/why/how — otherwise give safe phrase
     if "なぜ" in user_text or "どうして" in user_text:
         return "多くの場合、その背景には複数の要因が考えられます。"
     if "どうやって" in user_text or "どうすれば" in user_text:
@@ -178,22 +164,20 @@ def _simple_answer_hint(user_text):
     return "落ち着いて一つずつ整理することで、次の一歩が見えてくるかもしれません。"
 
 
-# ====== 非同期処理ワークフロー ======
-def process_and_push(user_id, original_text, reply_token=None):
+# ====== 非同期処理ワークフロー（target_id対応） ======
+def process_and_push(target_id, original_text, reply_token=None):
     """
-    Heavy work: build prompt, call Gemini, post-process, push to user.
-    This runs in a Thread so reply_token was already replied with an interim message.
+    target_id: userId or groupId or roomId
     """
     try:
-        # get memory and derive phase
-        memory = user_memory[user_id]
+        memory = conversation_memory[target_id]
         current_phase = memory["phase"]
         history = memory["history"]
 
         new_phase = detect_phase_from_text(current_phase, original_text, len(history))
         memory["phase"] = new_phase
 
-        prompt = build_prompt_with_context(user_id, original_text)
+        prompt = build_prompt_with_context(target_id, original_text)
 
         # Call Gemini
         try:
@@ -203,29 +187,26 @@ def process_and_push(user_id, original_text, reply_token=None):
             )
             reply_text = getattr(resp, "text", str(resp)).strip()
         except Exception as e:
-            # fail-safe fallback short reply
+            print("GenAI call failed:", e)
             reply_text = "すみません、ただいま外部情報の取得に失敗しました。もう一度お願いできますか？"
 
-        # ensure not question-only
         reply_text = ensure_answer_not_only_question(reply_text, original_text)
 
-        # update memory
+        # update memory using target_id key so group chats keep shared context
         memory["history"].append({"role": "user", "content": original_text})
         memory["history"].append({"role": "assistant", "content": reply_text})
-        # trim long history
         if len(memory["history"]) > MAX_HISTORY * 2:
             memory["history"] = memory["history"][-MAX_HISTORY*2 :]
 
-        # push result
+        # push result to the correct target (user/group/room)
         try:
-            line_api.push_message(user_id, TextSendMessage(text=reply_text))
-        except Exception:
-            # best-effort: if push fails, there's not much to do here
-            pass
-
-    except Exception:
-        # swallow all exceptions in background thread to avoid crashing
-        return
+            line_api.push_message(target_id, TextSendMessage(text=reply_text))
+            print(f"Pushed reply to {target_id}")
+        except Exception as e:
+            print("Push failed:", e)
+            # log and continue
+    except Exception as e:
+        print("Background processing error:", e)
 
 
 # ====== Flask webhook endpoint ======
@@ -244,7 +225,7 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     except Exception:
-        # continue even if handler not used; we'll parse body anyway
+        # continue; we'll parse body manually
         pass
 
     try:
@@ -254,8 +235,8 @@ def callback():
 
     events = data.get("events", [])
     for event in events:
+        # dedupe key: use event['replyToken'] if present else timestamp
         event_id = event.get("replyToken") or event.get("timestamp") or None
-        # simple duplicate guard
         if event_id and event_id in processed_event_ids:
             continue
         if event_id:
@@ -273,32 +254,48 @@ def callback():
                 pass
             continue
 
-        user_id = event["source"].get("userId")
-        user_text = msg.get("text", "").strip()
-        if not user_id or not user_text:
+        # Determine source and target_id (supports user/group/room)
+        source = event.get("source", {}) or {}
+        user_id = source.get("userId")
+        group_id = source.get("groupId")
+        room_id = source.get("roomId")
+
+        # choose target_id for push/message storage
+        if user_id:
+            target_id = user_id
+        elif group_id:
+            target_id = group_id
+        elif room_id:
+            target_id = room_id
+        else:
+            # unknown source type; skip
+            print("Unknown source in event:", source)
             continue
 
-        # Emergency handling
+        user_text = msg.get("text", "").strip()
+        if not user_text:
+            continue
+
+        # Emergency handling (check in original user_text)
         lowered = user_text.replace(" ", "")
         if any(k in lowered for k in EMERGENCY_KEYWORDS):
-            # immediate reply (use reply_token)
             try:
+                # Use reply_token for immediate reply
                 line_api.reply_message(event["replyToken"], TextSendMessage(text=ESCALATE_MESSAGE))
-            except Exception:
-                pass
+            except Exception as e:
+                print("Failed to send escalate message:", e)
             continue
 
-        # 1) immediate reply to satisfy replyToken constraints
+        # immediate reply to satisfy replyToken constraints (works for group as well)
         interim = "考え中です。少しお待ちください。"
         try:
             line_api.reply_message(event["replyToken"], TextSendMessage(text=interim))
-            # pass
-        except Exception:
-            # if reply fails, we still proceed to process and push (push may also fail)
-            pass
+        except Exception as e:
+            # log but continue to background processing
+            print("Immediate reply failed:", e)
 
-        # 2) spawn background thread to do heavy work (web search + Gemini)
-        Thread(target=process_and_push, args=(user_id, user_text, event.get("replyToken")), daemon=True).start()
+        # spawn background thread passing target_id (so group responses are pushed to the group)
+        Thread(target=process_and_push, args=(target_id, user_text, event.get("replyToken")), daemon=True).start()
 
     return "OK", 200
 
