@@ -261,10 +261,10 @@ def callback():
         room_id = source.get("roomId")
 
         # choose target_id for push/message storage
-        if user_id:
-            target_id = user_id
-        elif group_id:
+        if group_id:
             target_id = group_id
+        elif user_id:
+            target_id = user_id
         elif room_id:
             target_id = room_id
         else:
