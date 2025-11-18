@@ -1,4 +1,6 @@
-# app.py (グループ対応済みフル版)
+# app.py
+# 2025.11.18
+
 import os
 import json
 import time
@@ -261,6 +263,7 @@ def callback():
         room_id = source.get("roomId")
 
         # choose target_id for push/message storage
+        # 改修 group_idのチェックを先行した
         if group_id:
             target_id = group_id
         elif user_id:
@@ -287,12 +290,15 @@ def callback():
             continue
 
         # immediate reply to satisfy replyToken constraints (works for group as well)
+        # 考え中です。少しお待ちください。の表示を省略した
         interim = "考え中です。少しお待ちください。"
         try:
-            line_api.reply_message(event["replyToken"], TextSendMessage(text=interim))
+            # line_api.reply_message(event["replyToken"], TextSendMessage(text=interim))
+            continue
         except Exception as e:
             # log but continue to background processing
-            print("Immediate reply failed:", e)
+            # print("Immediate reply failed:", e)
+            continue
 
         # spawn background thread passing target_id (so group responses are pushed to the group)
         Thread(target=process_and_push, args=(target_id, user_text, event.get("replyToken")), daemon=True).start()
