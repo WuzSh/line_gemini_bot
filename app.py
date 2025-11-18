@@ -294,11 +294,10 @@ def callback():
         interim = "考え中です。少しお待ちください。"
         try:
             # line_api.reply_message(event["replyToken"], TextSendMessage(text=interim))
-            continue
+            pass
         except Exception as e:
             # log but continue to background processing
-            # print("Immediate reply failed:", e)
-            continue
+            print("Immediate reply failed:", e)
 
         # spawn background thread passing target_id (so group responses are pushed to the group)
         Thread(target=process_and_push, args=(target_id, user_text, event.get("replyToken")), daemon=True).start()
